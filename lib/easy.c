@@ -89,6 +89,27 @@
 static unsigned int  initialized;
 static long          init_flags;
 
+#ifdef USE_THREADS_POSIX
+#include <pthread.h>
+
+static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+#define global_init_lock() pthread_mutex_lock(&s_lock)
+#define global_init_unlock() pthread_mutex_unlock(&s_lock)
+
+#elif defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x600
+/* We can't use Windows CRITICAL_SECTION since there is no static initializer. */
+static SRWLOCK s_lock = SRWLOCK_INIT;
+
+#define global_init_lock() AcquireSRWLockExclusive(&s_lock)
+#define global_init_unlock() ReleaseSRWLockExclusive(&s_lock)
+
+#else
+
+#define global_init_lock()
+#define global_init_unlock()
+
+#endif
+
 /*
  * strdup (and other memory functions) is redefined in complicated
  * ways, but at this point it must be defined as the system-supplied strdup
@@ -207,7 +228,14 @@ static CURLcode global_init(long flags, bool memoryfuncs)
  */
 CURLcode curl_global_init(long flags)
 {
-  return global_init(flags, TRUE);
+  CURLcode result;
+  global_init_lock();
+
+  result = global_init(flags, TRUE);
+
+  global_init_unlock();
+
+  return result;
 }
 
 /*
@@ -218,15 +246,20 @@ CURLcode curl_global_init_mem(long flags, curl_malloc_callback m,
                               curl_free_callback f, curl_realloc_callback r,
                               curl_strdup_callback s, curl_calloc_callback c)
 {
+  CURLcode result;
+
   /* Invalid input, return immediately */
   if(!m || !f || !r || !s || !c)
     return CURLE_FAILED_INIT;
+
+  global_init_lock();
 
   if(initialized) {
     /* Already initialized, don't do it again, but bump the variable anyway to
        work like curl_global_init() and require the same amount of cleanup
        calls. */
     initialized++;
+    global_init_unlock();
     return CURLE_OK;
   }
 
@@ -239,7 +272,11 @@ CURLcode curl_global_init_mem(long flags, curl_malloc_callback m,
   Curl_ccalloc = c;
 
   /* Call the actual init function, but without setting */
-  return global_init(flags, FALSE);
+  result = global_init(flags, FALSE);
+
+  global_init_unlock();
+
+  return result;
 }
 
 /**
@@ -248,11 +285,17 @@ CURLcode curl_global_init_mem(long flags, curl_malloc_callback m,
  */
 void curl_global_cleanup(void)
 {
-  if(!initialized)
-    return;
+  global_init_lock();
 
-  if(--initialized)
+  if(!initialized) {
+    global_init_unlock();
     return;
+  }
+
+  if(--initialized) {
+    global_init_unlock();
+    return;
+  }
 
   Curl_ssl_cleanup();
   Curl_resolver_global_cleanup();
@@ -273,6 +316,8 @@ void curl_global_cleanup(void)
 #endif
 
   init_flags  = 0;
+
+  global_init_unlock();
 }
 
 /*
@@ -285,14 +330,18 @@ struct Curl_easy *curl_easy_init(void)
   struct Curl_easy *data;
 
   /* Make sure we inited the global SSL stuff */
+  global_init_lock();
+
   if(!initialized) {
-    result = curl_global_init(CURL_GLOBAL_DEFAULT);
+    result = global_init(CURL_GLOBAL_DEFAULT, TRUE);
     if(result) {
       /* something in the global init failed, return nothing */
       DEBUGF(fprintf(stderr, "Error: curl_global_init failed\n"));
+      global_init_unlock();
       return NULL;
     }
   }
+  global_init_unlock();
 
   /* We use curl_open() with undefined URL so far */
   result = Curl_open(&data);
