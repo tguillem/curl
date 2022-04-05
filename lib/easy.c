@@ -89,6 +89,85 @@
 static unsigned int  initialized;
 static long          init_flags;
 
+#ifdef USE_THREADS_POSIX
+#include <pthread.h>
+
+static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+#define GLOBAL_INIT_LOCK_BEGIN pthread_mutex_lock(&s_lock)
+#define GLOBAL_INIT_LOCK_END pthread_mutex_unlock(&s_lock)
+
+#elif defined(_WIN32_WINNT)
+/* We can't use Windows CRITICAL_SECTION since there is no static initializer. */
+
+struct win_mtx {
+  DWORD owner;
+};
+
+static struct win_mtx s_lock = { 0 };
+
+typedef BOOL(WINAPI *WAIT_ON_ADDRESS_FN)(VOID *, PVOID, SIZE_T, DWORD);
+typedef void(WINAPI *WAKE_BY_ADDRESS_SINGLE_FN)(VOID *);
+
+struct win_mtx_ctx {
+  HMODULE synchApiDll;
+  WAIT_ON_ADDRESS_FN WaitOnAddress;
+  WAKE_BY_ADDRESS_SINGLE_FN WakeByAddressSingle;
+};
+
+static void win_mtx_lock(struct win_mtx *m, struct win_mtx_ctx *ctx)
+{
+  DWORD cur_owner;
+
+  ctx->synchApiDll = Curl_load_library(TEXT("synchronization.dll"));
+  if(ctx->synchApiDll != NULL) {
+    ctx->WaitOnAddress =
+      CURLX_FUNCTION_CAST(WAIT_ON_ADDRESS_FN,
+                          (GetProcAddress(ctx->synchApiDll, "WaitOnAddress")));
+    ctx->WakeByAddressSingle =
+      CURLX_FUNCTION_CAST(WAKE_BY_ADDRESS_SINGLE_FN,
+                          (GetProcAddress(ctx->synchApiDll, "WakeByAddressSingle")));
+  }
+
+  cur_owner = GetCurrentThreadId();
+
+  while(true) {
+    DWORD prev_owner = InterlockedCompareExchangeAcquire(&m->owner, cur_owner, 0);
+
+    assert(prev_owner != cur_owner); /* Not recursive */
+
+    if(prev_owner == 0)
+      return;
+
+    if(ctx->WaitOnAddress == NULL || ctx->WakeByAddressSingle == NULL)
+      Sleep(50); /* 50 ms */
+    else
+      ctx->WaitOnAddress(&m->owner, &prev_owner, sizeof(prev_owner), INFINITE);
+  }
+}
+
+static void win_mtx_unlock(struct win_mtx *m, struct win_mtx_ctx *ctx)
+{
+  InterlockedExchange(&m->owner, 0);
+
+  if(ctx->WakeByAddressSingle != NULL)
+    ctx->WakeByAddressSingle(&m->owner);
+
+  if(ctx->synchApiDll != NULL)
+    FreeLibrary(ctx->synchApiDll);
+}
+
+#define GLOBAL_INIT_LOCK_BEGIN \
+  struct win_mtx_ctx win_mtx_ctx = { NULL, NULL, NULL }; \
+  win_mtx_lock(&s_lock, &win_mtx_ctx)
+#define GLOBAL_INIT_LOCK_END win_mtx_unlock(&s_lock, &win_mtx_ctx)
+
+#else
+
+#define GLOBAL_INIT_LOCK_BEGIN
+#define GLOBAL_INIT_LOCK_END
+
+#endif
+
 /*
  * strdup (and other memory functions) is redefined in complicated
  * ways, but at this point it must be defined as the system-supplied strdup
@@ -207,7 +286,14 @@ static CURLcode global_init(long flags, bool memoryfuncs)
  */
 CURLcode curl_global_init(long flags)
 {
-  return global_init(flags, TRUE);
+  CURLcode result;
+  GLOBAL_INIT_LOCK_BEGIN;
+
+  result = global_init(flags, TRUE);
+
+  GLOBAL_INIT_LOCK_END;
+
+  return result;
 }
 
 /*
@@ -218,15 +304,20 @@ CURLcode curl_global_init_mem(long flags, curl_malloc_callback m,
                               curl_free_callback f, curl_realloc_callback r,
                               curl_strdup_callback s, curl_calloc_callback c)
 {
+  CURLcode result;
+
   /* Invalid input, return immediately */
   if(!m || !f || !r || !s || !c)
     return CURLE_FAILED_INIT;
+
+  GLOBAL_INIT_LOCK_BEGIN;
 
   if(initialized) {
     /* Already initialized, don't do it again, but bump the variable anyway to
        work like curl_global_init() and require the same amount of cleanup
        calls. */
     initialized++;
+    GLOBAL_INIT_LOCK_END;
     return CURLE_OK;
   }
 
@@ -239,7 +330,11 @@ CURLcode curl_global_init_mem(long flags, curl_malloc_callback m,
   Curl_ccalloc = c;
 
   /* Call the actual init function, but without setting */
-  return global_init(flags, FALSE);
+  result = global_init(flags, FALSE);
+
+  GLOBAL_INIT_LOCK_END;
+
+  return result;
 }
 
 /**
@@ -248,11 +343,17 @@ CURLcode curl_global_init_mem(long flags, curl_malloc_callback m,
  */
 void curl_global_cleanup(void)
 {
-  if(!initialized)
-    return;
+  GLOBAL_INIT_LOCK_BEGIN;
 
-  if(--initialized)
+  if(!initialized) {
+    GLOBAL_INIT_LOCK_END;
     return;
+  }
+
+  if(--initialized) {
+    GLOBAL_INIT_LOCK_END;
+    return;
+  }
 
   Curl_ssl_cleanup();
   Curl_resolver_global_cleanup();
@@ -273,6 +374,8 @@ void curl_global_cleanup(void)
 #endif
 
   init_flags  = 0;
+
+  GLOBAL_INIT_LOCK_END;
 }
 
 /*
@@ -285,14 +388,18 @@ struct Curl_easy *curl_easy_init(void)
   struct Curl_easy *data;
 
   /* Make sure we inited the global SSL stuff */
+  GLOBAL_INIT_LOCK_BEGIN;
+
   if(!initialized) {
-    result = curl_global_init(CURL_GLOBAL_DEFAULT);
+    result = global_init(CURL_GLOBAL_DEFAULT, TRUE);
     if(result) {
       /* something in the global init failed, return nothing */
       DEBUGF(fprintf(stderr, "Error: curl_global_init failed\n"));
+      GLOBAL_INIT_LOCK_END;
       return NULL;
     }
   }
+  GLOBAL_INIT_LOCK_END;
 
   /* We use curl_open() with undefined URL so far */
   result = Curl_open(&data);
